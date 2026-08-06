@@ -10,11 +10,11 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Point to binary installed during build
+// Point to binary downloaded during build
 const YTDLP_BIN = path.join(__dirname, 'bin', 'yt-dlp');
 
 app.get('/ping', (req, res) => {
-    res.json({ status: 'alive', message: 'Backend is running smoothly' });
+    res.json({ status: 'alive', message: 'Backend running' });
 });
 
 app.get('/download', (req, res) => {
@@ -27,12 +27,12 @@ app.get('/download', (req, res) => {
 
     console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
 
-    let formatArgs = '-f "bestvideo+bestaudio/best" --recode-video mp4 --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"';
+    let formatArgs = '-f "best[ext=mp4]/best" --no-playlist';
     let expectedExt = 'mp4';
     let contentType = 'video/mp4';
 
     if (mode === 'audio') {
-        formatArgs = '-x --audio-format mp3 --audio-quality 0 --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"';
+        formatArgs = '-f "bestaudio" --no-playlist';
         expectedExt = 'mp3';
         contentType = 'audio/mpeg';
     } else if (mode === 'picture') {
@@ -41,82 +41,52 @@ app.get('/download', (req, res) => {
         contentType = 'image/jpeg';
     }
 
-    const command = `${YTDLP_BIN} ${formatArgs} --print filename "${videoUrl}"`;
+    const userAgent = '"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"';
 
-    exec(command, (err, stdout, stderr) => {
-        if (err && mode !== 'picture') {
-            console.error('Extraction error:', stderr || err.message);
-            return res.status(500).send('Failed to analyze URL. ERROR: ' + (stderr || err.message));
-        }
-
-        const rawFilename = stdout ? (stdout.trim().split('\n').pop() || ('media.' + expectedExt)) : ('media.' + expectedExt);
-        let finalFilename = rawFilename.replace(/\.[^/.]+$/, '.' + expectedExt);
-        if (!finalFilename.endsWith('.' + expectedExt)) {
-            finalFilename += '.' + expectedExt;
-        }
-
-        res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(finalFilename) + '"');
-        res.setHeader('Content-Type', contentType);
-
-        let downloadCommand = '';
-        if (mode === 'picture') {
-            downloadCommand = `${YTDLP_BIN} --write-thumbnail --skip-download --print thumbnail "${videoUrl}"`;
-        } else {
-            downloadCommand = `${YTDLP_BIN} ${formatArgs} -o - "${videoUrl}"`;
-        }
-
-        const child = exec(downloadCommand, { maxBuffer: 1024 * 1024 * 100 });
-
-        if (mode === 'picture') {
-            let dataOutput = '';
-            child.stdout.on('data', (chunk) => {
-                dataOutput += chunk;
-            });
-            child.on('close', () => {
-                const imageUrl = dataOutput.trim().split('\n').pop();
-                if (imageUrl && imageUrl.startsWith('http')) {
-                    https.get(imageUrl, (imgRes) => {
-                        imgRes.pipe(res);
-                    }).on('error', (imgErr) => {
-                        if (!res.headersSent) res.status(500).send('Failed to fetch cover picture.');
-                    });
-                } else {
-                    if (!res.headersSent) res.status(500).send('Could not extract thumbnail image URL.');
-                }
-            });
-        } else {
-            child.stdout.pipe(res);
-        }
-
-        child.on('error', (streamErr) => {
-            console.error('Stream transmission error:', streamErr);
-            if (!res.headersSent) {
-                res.status(500).send('Error streaming media payload.');
+    if (mode === 'picture') {
+        const cmd = `${YTDLP_BIN} --write-thumbnail --skip-download --print thumbnail --user-agent ${userAgent} "${videoUrl}"`;
+        exec(cmd, (err, stdout) => {
+            if (err) return res.status(500).send('Failed to fetch cover picture: ' + err.message);
+            const imageUrl = stdout.trim().split('\n').pop();
+            if (imageUrl && imageUrl.startsWith('http')) {
+                res.setHeader('Content-Type', contentType);
+                https.get(imageUrl, (imgRes) => imgRes.pipe(res)).on('error', () => res.status(500).send('Image download error.'));
+            } else {
+                res.status(500).send('Could not extract thumbnail.');
             }
         });
+        return;
+    }
+
+    // Direct stream command
+    const downloadCmd = `${YTDLP_BIN} ${formatArgs} --user-agent ${userAgent} -o - "${videoUrl}"`;
+
+    res.setHeader('Content-Disposition', `attachment; filename="download.${expectedExt}"`);
+    res.setHeader('Content-Type', contentType);
+
+    const child = exec(downloadCmd, { maxBuffer: 1024 * 1024 * 200 });
+
+    child.stdout.pipe(res);
+
+    child.stderr.on('data', (data) => {
+        console.error('[yt-dlp log]:', data.toString());
+    });
+
+    child.on('error', (err) => {
+        console.error('Process error:', err);
+        if (!res.headersSent) res.status(500).send('Stream error: ' + err.message);
     });
 });
 
 app.get('/history', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Download History</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
-    <main class="max-w-md w-full bg-slate-900 rounded-2xl p-6 border border-slate-800 space-y-4">
-        <div class="flex justify-between items-center">
-            <a href="/" class="text-indigo-400 text-sm">&larr; Back</a>
-            <h1 class="font-bold">History</h1>
-        </div>
-        <div id="logs" class="text-xs space-y-2"></div>
-    </main>
+<html>
+<body style="background:#090d16;color:#fff;font-family:sans-serif;padding:20px;">
+    <h2>Download History</h2>
+    <div id="logs"></div>
     <script>
         const history = JSON.parse(localStorage.getItem('downloader_history') || '[]');
-        document.getElementById('logs').innerHTML = history.length ? history.map(h => \`<div class="p-3 bg-slate-950 rounded-xl border border-slate-800 flex justify-between"><span>\${h.url}</span><span class="text-slate-500">\${h.mode}</span></div>\`).join('') : '<p class="text-center text-slate-500 py-6">No downloads recorded.</p>';
+        document.getElementById('logs').innerHTML = history.length ? history.map(h => \`<p>\${h.url} - \${h.mode}</p>\`).join('') : 'No downloads.';
     </script>
 </body>
 </html>`);
@@ -127,50 +97,33 @@ app.get('/', (req, res) => {
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Downloader Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: { colors: { brand: { 500: '#6366f1', 600: '#4f46e5' } } }
-            }
-        }
-    </script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-    </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-[100dvh] flex items-center justify-center p-3 sm:p-4 antialiased selection:bg-brand-500 selection:text-white">
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
 
     <main class="max-w-md w-full bg-slate-900 rounded-3xl shadow-2xl overflow-hidden border border-slate-800 flex flex-col relative">
-
-        <div class="bg-gradient-to-br from-brand-600 to-indigo-700 p-6 text-center relative">
+        <div class="bg-gradient-to-br from-indigo-600 to-violet-700 p-6 text-center relative">
             <div class="absolute top-4 right-4 flex items-center space-x-1.5 bg-slate-950/40 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
                 <span id="server-status-dot" class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
-                <span id="server-status-text" class="text-[10px] font-medium text-white tracking-wide">Checking...</span>
+                <span id="server-status-text" class="text-[10px] font-medium text-white">Checking...</span>
             </div>
-
-            <div class="w-16 h-16 mx-auto bg-white/20 backdrop-blur-md rounded-2xl flex items-center justify-center mb-4 shadow-inner mt-2">
+            <div class="w-14 h-14 mx-auto bg-white/20 backdrop-blur-md rounded-2xl flex items-center justify-center mb-3">
                  <i class="ph ph-download-simple text-3xl text-white"></i>
             </div>
-            <h1 class="text-2xl font-bold text-white mb-1 tracking-tight">Downloader Pro</h1>
-            <p class="text-indigo-100 text-xs sm:text-sm font-medium">Save videos locally, without watermarks.</p>
+            <h1 class="text-xl font-bold text-white">Downloader Pro</h1>
+            <p class="text-indigo-100 text-xs mt-1">Fast, watermark-free media downloader</p>
         </div>
 
-        <div class="p-6 space-y-5 flex-1">
+        <div class="p-6 space-y-5">
             <form onsubmit="handleDownload(event)" class="space-y-4">
                 <div>
-                    <label for="video-url" class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                        Video Link (TikTok, X, YouTube, Insta)
-                    </label>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link</label>
                     <div class="relative flex items-center">
-                        <span class="absolute left-3 text-slate-400"><i class="ph ph-link text-lg"></i></span>
-                        <input id="video-url" type="text" required placeholder="Paste media link here..." class="w-full pl-10 pr-20 py-3.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-[16px] placeholder-slate-500 focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-all" />
-                        <button type="button" onclick="pasteClipboard()" class="absolute right-2 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors">Paste</button>
+                        <input id="video-url" type="text" required placeholder="Paste media link here..." class="w-full pl-4 pr-20 py-3.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-sm focus:ring-2 focus:ring-indigo-500 outline-none" />
+                        <button type="button" onclick="pasteClipboard()" class="absolute right-2 px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-medium">Paste</button>
                     </div>
                 </div>
 
@@ -179,37 +132,20 @@ app.get('/', (req, res) => {
                     <div class="grid grid-cols-3 gap-2">
                         <label class="cursor-pointer">
                             <input type="radio" name="download-mode" value="video" checked class="peer sr-only">
-                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-brand-500 peer-checked:bg-brand-500/10 text-center">
-                                <i class="ph ph-file-video text-lg text-brand-400 mb-1 block"></i>
-                                <span class="text-[11px] font-medium text-slate-200">Video</span>
-                            </div>
+                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">Video</div>
                         </label>
                         <label class="cursor-pointer">
                             <input type="radio" name="download-mode" value="audio" class="peer sr-only">
-                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-brand-500 peer-checked:bg-brand-500/10 text-center">
-                                <i class="ph ph-music-notes text-lg text-emerald-400 mb-1 block"></i>
-                                <span class="text-[11px] font-medium text-slate-200">MP3</span>
-                            </div>
+                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">MP3</div>
                         </label>
                         <label class="cursor-pointer">
                             <input type="radio" name="download-mode" value="picture" class="peer sr-only">
-                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-brand-500 peer-checked:bg-brand-500/10 text-center">
-                                <i class="ph ph-image text-lg text-amber-400 mb-1 block"></i>
-                                <span class="text-[11px] font-medium text-slate-200">Cover</span>
-                            </div>
+                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">Cover</div>
                         </label>
                     </div>
                 </div>
 
-                <div id="error-box" class="hidden bg-red-500/10 text-red-400 p-3.5 rounded-xl text-xs border border-red-500/20 flex items-start space-x-2">
-                    <i class="ph ph-warning-circle text-base flex-shrink-0 mt-0.5"></i>
-                    <span id="error-text" class="flex-1">An error occurred.</span>
-                </div>
-
-                <button id="submit-btn" type="submit" class="w-full py-4 px-4 rounded-xl font-semibold text-white bg-brand-600 hover:bg-brand-500 transition-all flex items-center justify-center space-x-2 shadow-lg shadow-brand-600/25">
-                    <i class="ph ph-cloud-arrow-down text-xl"></i>
-                    <span>Download Media</span>
-                </button>
+                <button id="submit-btn" type="submit" class="w-full py-3.5 px-4 rounded-xl font-semibold text-white bg-indigo-600 hover:bg-indigo-500 transition-all text-sm">Download</button>
             </form>
         </div>
     </main>
@@ -223,7 +159,7 @@ app.get('/', (req, res) => {
             try {
                 const res = await fetch(BACKEND_URL + '/ping').catch(() => null);
                 if (res && res.ok) {
-                    dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]";
+                    dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
                     text.textContent = "Online";
                 } else throw new Error();
             } catch (e) {
@@ -238,50 +174,18 @@ app.get('/', (req, res) => {
             try {
                 const text = await navigator.clipboard.readText();
                 if (text) document.getElementById('video-url').value = text;
-            } catch (err) {
-                alert('Clipboard access restricted. Long-press to paste manually.');
-            }
+            } catch (err) { alert('Long-press input box to paste manually.'); }
         }
 
-        async function handleDownload(e) {
+        function handleDownload(e) {
             e.preventDefault();
-            const urlInput = document.getElementById('video-url');
-            const submitBtn = document.getElementById('submit-btn');
-            const errorBox = document.getElementById('error-box');
-            const errorText = document.getElementById('error-text');
-
-            const url = urlInput.value.trim();
-            const selectedMode = document.querySelector('input[name="download-mode"]:checked').value;
-
-            if (!url) return;
-
-            errorBox.classList.add('hidden');
-            submitBtn.disabled = true;
-            submitBtn.innerHTML = '<i class="ph ph-spinner animate-spin text-xl"></i><span>Processing Stream...</span>';
-
-            try {
-                const checkRes = await fetch(BACKEND_URL + '/ping').catch(() => null);
-                if (!checkRes) throw new Error("Backend server is starting up or unreachable. Please retry in 20 seconds.");
-
-                window.location.href = BACKEND_URL + '/download?url=' + encodeURIComponent(url) + '&mode=' + selectedMode;
-
-                setTimeout(() => {
-                    submitBtn.disabled = false;
-                    submitBtn.innerHTML = '<i class="ph ph-cloud-arrow-down text-xl"></i><span>Download Media</span>';
-                }, 3000);
-
-            } catch (err) {
-                errorBox.classList.remove('hidden');
-                errorText.textContent = err.message || "An unexpected error occurred.";
-                submitBtn.disabled = false;
-                submitBtn.innerHTML = '<i class="ph ph-cloud-arrow-down text-xl"></i><span>Download Media</span>';
-            }
+            const url = document.getElementById('video-url').value.trim();
+            const mode = document.querySelector('input[name="download-mode"]:checked').value;
+            if (url) window.location.href = BACKEND_URL + '/download?url=' + encodeURIComponent(url) + '&mode=' + mode;
         }
     </script>
 </body>
 </html>`);
 });
 
-app.listen(PORT, () => {
-    console.log('Downloader server running on port ' + PORT);
-});
+app.listen(PORT, () => console.log('Server running on port ' + PORT));
