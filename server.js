@@ -1,8 +1,7 @@
 const express = require('express');
-const { exec } = require('child_process');
 const cors = require('cors');
 const https = require('https');
-const path = require('path');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -10,14 +9,11 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Point to binary downloaded during build
-const YTDLP_BIN = path.join(__dirname, 'bin', 'yt-dlp');
-
 app.get('/ping', (req, res) => {
-    res.json({ status: 'alive', message: 'Backend running' });
+    res.json({ status: 'alive', message: 'Backend running smoothly' });
 });
 
-app.get('/download', (req, res) => {
+app.get('/download', async (req, res) => {
     const videoUrl = req.query.url;
     const mode = req.query.mode || 'video';
 
@@ -27,69 +23,58 @@ app.get('/download', (req, res) => {
 
     console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
 
-    let formatArgs = '-f "best[ext=mp4]/best" --no-playlist';
-    let expectedExt = 'mp4';
-    let contentType = 'video/mp4';
-
-    if (mode === 'audio') {
-        formatArgs = '-f "bestaudio" --no-playlist';
-        expectedExt = 'mp3';
-        contentType = 'audio/mpeg';
-    } else if (mode === 'picture') {
-        formatArgs = '--write-thumbnail --skip-download';
-        expectedExt = 'jpg';
-        contentType = 'image/jpeg';
-    }
-
-    const userAgent = '"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"';
-
-    if (mode === 'picture') {
-        const cmd = `${YTDLP_BIN} --write-thumbnail --skip-download --print thumbnail --user-agent ${userAgent} "${videoUrl}"`;
-        exec(cmd, (err, stdout) => {
-            if (err) return res.status(500).send('Failed to fetch cover picture: ' + err.message);
-            const imageUrl = stdout.trim().split('\n').pop();
-            if (imageUrl && imageUrl.startsWith('http')) {
-                res.setHeader('Content-Type', contentType);
-                https.get(imageUrl, (imgRes) => imgRes.pipe(res)).on('error', () => res.status(500).send('Image download error.'));
-            } else {
-                res.status(500).send('Could not extract thumbnail.');
-            }
+    try {
+        // Use Cobalt Public API Instance for robust serverless extraction
+        const apiResponse = await fetch('https://api.cobalt.tools/api/json', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            },
+            body: JSON.stringify({
+                url: videoUrl,
+                downloadMode: mode === 'audio' ? 'audio' : 'auto',
+                videoQuality: '720',
+                audioFormat: 'mp3'
+            })
         });
-        return;
+
+        const data = await apiResponse.json();
+
+        if (data && (data.url || data.picker)) {
+            const targetStreamUrl = data.url || (data.picker && data.picker[0] ? data.picker[0].url : null);
+
+            if (!targetStreamUrl) {
+                return res.status(500).send('Could not extract direct stream URL.');
+            }
+
+            const ext = mode === 'audio' ? 'mp3' : 'mp4';
+            const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
+
+            res.setHeader('Content-Disposition', `attachment; filename="media_download.${ext}"`);
+            res.setHeader('Content-Type', contentType);
+
+            const client = targetStreamUrl.startsWith('https') ? https : http;
+            client.get(targetStreamUrl, (streamRes) => {
+                if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
+                    client.get(streamRes.headers.location, (redirectRes) => {
+                        redirectRes.pipe(res);
+                    });
+                } else {
+                    streamRes.pipe(res);
+                }
+            }).on('error', (err) => {
+                res.status(500).send('Error piping stream: ' + err.message);
+            });
+
+        } else {
+            res.status(500).send('Extraction failed. Check if link is valid or public: ' + (data.text || 'Unknown API response'));
+        }
+    } catch (err) {
+        console.error('Download error:', err);
+        res.status(500).send('Server processing error: ' + err.message);
     }
-
-    // Direct stream command
-    const downloadCmd = `${YTDLP_BIN} ${formatArgs} --user-agent ${userAgent} -o - "${videoUrl}"`;
-
-    res.setHeader('Content-Disposition', `attachment; filename="download.${expectedExt}"`);
-    res.setHeader('Content-Type', contentType);
-
-    const child = exec(downloadCmd, { maxBuffer: 1024 * 1024 * 200 });
-
-    child.stdout.pipe(res);
-
-    child.stderr.on('data', (data) => {
-        console.error('[yt-dlp log]:', data.toString());
-    });
-
-    child.on('error', (err) => {
-        console.error('Process error:', err);
-        if (!res.headersSent) res.status(500).send('Stream error: ' + err.message);
-    });
-});
-
-app.get('/history', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html>
-<body style="background:#090d16;color:#fff;font-family:sans-serif;padding:20px;">
-    <h2>Download History</h2>
-    <div id="logs"></div>
-    <script>
-        const history = JSON.parse(localStorage.getItem('downloader_history') || '[]');
-        document.getElementById('logs').innerHTML = history.length ? history.map(h => \`<p>\${h.url} - \${h.mode}</p>\`).join('') : 'No downloads.';
-    </script>
-</body>
-</html>`);
 });
 
 app.get('/', (req, res) => {
@@ -120,7 +105,7 @@ app.get('/', (req, res) => {
         <div class="p-6 space-y-5">
             <form onsubmit="handleDownload(event)" class="space-y-4">
                 <div>
-                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link</label>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link (X, TikTok, YouTube)</label>
                     <div class="relative flex items-center">
                         <input id="video-url" type="text" required placeholder="Paste media link here..." class="w-full pl-4 pr-20 py-3.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-sm focus:ring-2 focus:ring-indigo-500 outline-none" />
                         <button type="button" onclick="pasteClipboard()" class="absolute right-2 px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-medium">Paste</button>
@@ -129,18 +114,14 @@ app.get('/', (req, res) => {
 
                 <div>
                     <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Format</label>
-                    <div class="grid grid-cols-3 gap-2">
+                    <div class="grid grid-cols-2 gap-2">
                         <label class="cursor-pointer">
                             <input type="radio" name="download-mode" value="video" checked class="peer sr-only">
-                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">Video</div>
+                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">Video (MP4)</div>
                         </label>
                         <label class="cursor-pointer">
                             <input type="radio" name="download-mode" value="audio" class="peer sr-only">
-                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">MP3</div>
-                        </label>
-                        <label class="cursor-pointer">
-                            <input type="radio" name="download-mode" value="picture" class="peer sr-only">
-                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">Cover</div>
+                            <div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 peer-checked:border-indigo-500 peer-checked:bg-indigo-500/10 text-center text-xs">Audio (MP3)</div>
                         </label>
                     </div>
                 </div>
