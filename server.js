@@ -1,7 +1,8 @@
 const express = require('express');
+const { exec } = require('child_process');
 const cors = require('cors');
 const https = require('https');
-const youtubeDl = require('yt-dlp-exec');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -9,11 +10,14 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+// Point to binary installed during build
+const YTDLP_BIN = path.join(__dirname, 'bin', 'yt-dlp');
+
 app.get('/ping', (req, res) => {
     res.json({ status: 'alive', message: 'Backend is running smoothly' });
 });
 
-app.get('/download', async (req, res) => {
+app.get('/download', (req, res) => {
     const videoUrl = req.query.url;
     const mode = req.query.mode || 'video';
 
@@ -23,73 +27,74 @@ app.get('/download', async (req, res) => {
 
     console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
 
-    let contentType = 'video/mp4';
+    let formatArgs = '-f "bestvideo+bestaudio/best" --recode-video mp4 --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"';
     let expectedExt = 'mp4';
+    let contentType = 'video/mp4';
 
     if (mode === 'audio') {
-        contentType = 'audio/mpeg';
+        formatArgs = '-x --audio-format mp3 --audio-quality 0 --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"';
         expectedExt = 'mp3';
+        contentType = 'audio/mpeg';
     } else if (mode === 'picture') {
-        contentType = 'image/jpeg';
+        formatArgs = '--write-thumbnail --skip-download';
         expectedExt = 'jpg';
+        contentType = 'image/jpeg';
     }
 
-    try {
-        if (mode === 'picture') {
-            const output = await youtubeDl(videoUrl, {
-                writeThumbnail: true,
-                skipDownload: true,
-                print: 'thumbnail'
-            });
-            const imageUrl = output.trim().split('\n').pop();
-            if (imageUrl && imageUrl.startsWith('http')) {
-                res.setHeader('Content-Type', contentType);
-                https.get(imageUrl, (imgRes) => {
-                    imgRes.pipe(res);
-                }).on('error', () => {
-                    if (!res.headersSent) res.status(500).send('Failed to fetch cover picture.');
-                });
-            } else {
-                res.status(500).send('Could not extract thumbnail image URL.');
-            }
-        } else {
-            // Get extracted filename
-            const filenameOutput = await youtubeDl(videoUrl, {
-                print: 'filename',
-                addHeader: 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            });
+    const command = `${YTDLP_BIN} ${formatArgs} --print filename "${videoUrl}"`;
 
-            const rawFilename = filenameOutput ? (filenameOutput.trim().split('\n').pop() || ('media.' + expectedExt)) : ('media.' + expectedExt);
-            let finalFilename = rawFilename.replace(/\.[^/.]+$/, '.' + expectedExt);
-
-            res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(finalFilename) + '"');
-            res.setHeader('Content-Type', contentType);
-
-            const options = {
-                output: '-',
-                addHeader: 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            };
-
-            if (mode === 'audio') {
-                options.extractAudio = true;
-                options.audioFormat = 'mp3';
-            } else {
-                options.format = 'bestvideo+bestaudio/best';
-                options.recodeVideo = 'mp4';
-            }
-
-            const subprocess = youtubeDl.exec(videoUrl, options);
-            subprocess.stdout.pipe(res);
-
-            subprocess.on('error', (err) => {
-                console.error('Extraction error:', err);
-                if (!res.headersSent) res.status(500).send('Stream error: ' + err.message);
-            });
+    exec(command, (err, stdout, stderr) => {
+        if (err && mode !== 'picture') {
+            console.error('Extraction error:', stderr || err.message);
+            return res.status(500).send('Failed to analyze URL. ERROR: ' + (stderr || err.message));
         }
-    } catch (err) {
-        console.error('Execution error:', err);
-        if (!res.headersSent) res.status(500).send('Failed to process URL: ' + err.message);
-    }
+
+        const rawFilename = stdout ? (stdout.trim().split('\n').pop() || ('media.' + expectedExt)) : ('media.' + expectedExt);
+        let finalFilename = rawFilename.replace(/\.[^/.]+$/, '.' + expectedExt);
+        if (!finalFilename.endsWith('.' + expectedExt)) {
+            finalFilename += '.' + expectedExt;
+        }
+
+        res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(finalFilename) + '"');
+        res.setHeader('Content-Type', contentType);
+
+        let downloadCommand = '';
+        if (mode === 'picture') {
+            downloadCommand = `${YTDLP_BIN} --write-thumbnail --skip-download --print thumbnail "${videoUrl}"`;
+        } else {
+            downloadCommand = `${YTDLP_BIN} ${formatArgs} -o - "${videoUrl}"`;
+        }
+
+        const child = exec(downloadCommand, { maxBuffer: 1024 * 1024 * 100 });
+
+        if (mode === 'picture') {
+            let dataOutput = '';
+            child.stdout.on('data', (chunk) => {
+                dataOutput += chunk;
+            });
+            child.on('close', () => {
+                const imageUrl = dataOutput.trim().split('\n').pop();
+                if (imageUrl && imageUrl.startsWith('http')) {
+                    https.get(imageUrl, (imgRes) => {
+                        imgRes.pipe(res);
+                    }).on('error', (imgErr) => {
+                        if (!res.headersSent) res.status(500).send('Failed to fetch cover picture.');
+                    });
+                } else {
+                    if (!res.headersSent) res.status(500).send('Could not extract thumbnail image URL.');
+                }
+            });
+        } else {
+            child.stdout.pipe(res);
+        }
+
+        child.on('error', (streamErr) => {
+            console.error('Stream transmission error:', streamErr);
+            if (!res.headersSent) {
+                res.status(500).send('Error streaming media payload.');
+            }
+        });
+    });
 });
 
 app.get('/history', (req, res) => {
@@ -97,18 +102,17 @@ app.get('/history', (req, res) => {
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Download History - Downloader Pro</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download History</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/@phosphor-icons/web"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-[100dvh] flex items-center justify-center p-3 antialiased">
-    <main class="max-w-md w-full bg-slate-900 rounded-3xl shadow-2xl p-6 border border-slate-800 space-y-4">
-        <div class="flex items-center justify-between">
-            <a href="/" class="text-brand-400 flex items-center space-x-1 text-sm"><i class="ph ph-arrow-left"></i> <span>Back</span></a>
-            <h1 class="font-bold text-lg">Download Logs</h1>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
+    <main class="max-w-md w-full bg-slate-900 rounded-2xl p-6 border border-slate-800 space-y-4">
+        <div class="flex justify-between items-center">
+            <a href="/" class="text-indigo-400 text-sm">&larr; Back</a>
+            <h1 class="font-bold">History</h1>
         </div>
-        <div id="logs" class="space-y-2 text-xs"></div>
+        <div id="logs" class="text-xs space-y-2"></div>
     </main>
     <script>
         const history = JSON.parse(localStorage.getItem('downloader_history') || '[]');
