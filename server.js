@@ -9,72 +9,117 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Custom HTTPS Agent to handle legacy/mismatched SSL certs on external fallback APIs
-const insecureAgent = new https.Agent({
-    rejectUnauthorized: false
-});
+const insecureAgent = new https.Agent({ rejectUnauthorized: false });
 
 app.get('/ping', (req, res) => {
     res.json({ status: 'alive', message: 'Backend running smoothly' });
 });
 
+// Helper function to clean clean query parameters for better parsing
+function cleanUrl(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        // Retain standard youtube v parameter, drop tracking parameters like ?si=
+        if (parsed.hostname.includes('youtube.com') || parsed.hostname.includes('youtu.be')) {
+            return rawUrl.split('&si=')[0].split('?si=')[0];
+        }
+        return rawUrl;
+    } catch (e) {
+        return rawUrl;
+    }
+}
+
 app.get('/download', async (req, res) => {
-    const videoUrl = req.query.url;
+    let videoUrl = req.query.url;
     const mode = req.query.mode || 'video';
 
     if (!videoUrl) {
         return res.status(400).send('Missing video URL parameter.');
     }
 
+    videoUrl = cleanUrl(videoUrl.trim());
     console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
 
+    let directMediaUrl = null;
+
     try {
-        let directMediaUrl = null;
+        // --- ENGINE 1: Primary Multi-Service API ---
+        try {
+            const rapidRes = await fetch(`https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink`, {
+                method: 'POST',
+                headers: {
+                    'x-rapidapi-key': '2b9347d4e3msh802bf1c9441fb42p19a16fjsn1869e5d4a13e',
+                    'x-rapidapi-host': 'social-download-all-in-one.p.rapidapi.com',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ url: videoUrl })
+            });
 
-        // 1. Try Primary RapidAPI Multi-Downloader
-        const rapidRes = await fetch(`https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink`, {
-            method: 'POST',
-            headers: {
-                'x-rapidapi-key': '2b9347d4e3msh802bf1c9441fb42p19a16fjsn1869e5d4a13e',
-                'x-rapidapi-host': 'social-download-all-in-one.p.rapidapi.com',
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ url: videoUrl })
-        }).catch(() => null);
+            if (rapidRes.ok) {
+                const data = await rapidRes.json();
+                if (data && data.medias && data.medias.length > 0) {
+                    const match = mode === 'audio'
+                        ? data.medias.find(m => m.extension === 'mp3' || (m.quality && m.quality.includes('audio'))) || data.medias[0]
+                        : data.medias.find(m => m.extension === 'mp4' || (m.quality && m.quality.includes('HD'))) || data.medias[0];
+                    directMediaUrl = match ? match.url : null;
+                }
+            }
+        } catch (e) {
+            console.log('Engine 1 skipped:', e.message);
+        }
 
-        if (rapidRes && rapidRes.ok) {
-            const data = await rapidRes.json();
-            if (data && data.medias && data.medias.length > 0) {
-                const match = mode === 'audio'
-                    ? data.medias.find(m => m.extension === 'mp3' || m.quality.includes('audio')) || data.medias[0]
-                    : data.medias.find(m => m.extension === 'mp4' || m.quality.includes('HD')) || data.medias[0];
-                directMediaUrl = match ? match.url : null;
+        // --- ENGINE 2: Cobalt Public Engine Fallback ---
+        if (!directMediaUrl) {
+            try {
+                const cobaltRes = await fetch('https://api.cobalt.tools/api/json', {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
+                        'User-Agent': 'Mozilla/5.0'
+                    },
+                    body: JSON.stringify({
+                        url: videoUrl,
+                        downloadMode: mode === 'audio' ? 'audio' : 'auto',
+                        videoQuality: '720'
+                    })
+                });
+
+                if (cobaltRes.ok) {
+                    const cData = await cobaltRes.json();
+                    directMediaUrl = cData.url || (cData.picker && cData.picker[0] ? cData.picker[0].url : null);
+                }
+            } catch (e) {
+                console.log('Engine 2 skipped:', e.message);
             }
         }
 
-        // 2. Fallback Resolver (With SSL Bypass for Mismatched Certs)
+        // --- ENGINE 3: TikTok / Social Dedicated Resolver ---
         if (!directMediaUrl) {
-            const fallbackRes = await fetch(`https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(videoUrl)}`, {
-                agent: insecureAgent
-            }).catch(() => null);
-
-            if (fallbackRes && fallbackRes.ok) {
-                const fbData = await fallbackRes.json();
-                directMediaUrl = fbData.video || fbData.hdplay || fbData.url || (fbData.music ? fbData.music.play_url : null);
+            try {
+                const tikRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}`);
+                if (tikRes.ok) {
+                    const tData = await tikRes.json();
+                    if (tData && tData.data) {
+                        directMediaUrl = mode === 'audio' ? tData.data.music : (tData.data.play || tData.data.wmplay);
+                    }
+                }
+            } catch (e) {
+                console.log('Engine 3 skipped:', e.message);
             }
         }
 
         if (!directMediaUrl) {
-            return res.status(500).send('Unable to extract direct media link. Please verify the URL is public.');
+            return res.status(500).send('Unable to extract direct media link. Please verify the link is public and accessible.');
         }
 
         const ext = mode === 'audio' ? 'mp3' : 'mp4';
         const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
 
-        res.setHeader('Content-Disposition', `attachment; filename="download.${ext}"`);
+        res.setHeader('Content-Disposition', `attachment; filename="downloader_media.${ext}"`);
         res.setHeader('Content-Type', contentType);
 
-        // Pipe direct stream payload back to client
+        // Pipe direct stream buffer back to user
         const client = directMediaUrl.startsWith('https') ? https : http;
         const streamReq = client.get(directMediaUrl, {
             rejectUnauthorized: false,
@@ -91,12 +136,12 @@ app.get('/download', async (req, res) => {
         });
 
         streamReq.on('error', (err) => {
-            if (!res.headersSent) res.status(500).send('Stream transfer error: ' + err.message);
+            if (!res.headersSent) res.status(500).send('Stream error: ' + err.message);
         });
 
     } catch (err) {
         console.error('Download error:', err);
-        if (!res.headersSent) res.status(500).send('Server processing error: ' + err.message);
+        if (!res.headersSent) res.status(500).send('Server error: ' + err.message);
     }
 });
 
@@ -122,7 +167,7 @@ app.get('/', (req, res) => {
                  <i class="ph ph-download-simple text-3xl text-white"></i>
             </div>
             <h1 class="text-xl font-bold text-white">Downloader Pro</h1>
-            <p class="text-indigo-100 text-xs mt-1">High-speed media extraction</p>
+            <p class="text-indigo-100 text-xs mt-1">Multi-Engine High-Speed Extractor</p>
         </div>
 
         <div class="p-6 space-y-5">
