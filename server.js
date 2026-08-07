@@ -9,6 +9,11 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+// Custom HTTPS Agent to handle legacy/mismatched SSL certs on external fallback APIs
+const insecureAgent = new https.Agent({
+    rejectUnauthorized: false
+});
+
 app.get('/ping', (req, res) => {
     res.json({ status: 'alive', message: 'Backend running smoothly' });
 });
@@ -24,67 +29,69 @@ app.get('/download', async (req, res) => {
     console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
 
     try {
-        // High-availability social media extraction service
-        const response = await fetch(`https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink`, {
+        let directMediaUrl = null;
+
+        // 1. Try Primary RapidAPI Multi-Downloader
+        const rapidRes = await fetch(`https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink`, {
             method: 'POST',
             headers: {
-                'x-rapidapi-key': '2b9347d4e3msh802bf1c9441fb42p19a16fjsn1869e5d4a13e', // Public API proxy key
+                'x-rapidapi-key': '2b9347d4e3msh802bf1c9441fb42p19a16fjsn1869e5d4a13e',
                 'x-rapidapi-host': 'social-download-all-in-one.p.rapidapi.com',
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({ url: videoUrl })
         }).catch(() => null);
 
-        let directMediaUrl = null;
-
-        if (response && response.ok) {
-            const data = await response.json();
+        if (rapidRes && rapidRes.ok) {
+            const data = await rapidRes.json();
             if (data && data.medias && data.medias.length > 0) {
-                // Pick highest quality video or audio
-                const match = mode === 'audio' 
+                const match = mode === 'audio'
                     ? data.medias.find(m => m.extension === 'mp3' || m.quality.includes('audio')) || data.medias[0]
                     : data.medias.find(m => m.extension === 'mp4' || m.quality.includes('HD')) || data.medias[0];
                 directMediaUrl = match ? match.url : null;
             }
         }
 
-        // Reliable fallback resolver if primary API returns empty
+        // 2. Fallback Resolver (With SSL Bypass for Mismatched Certs)
         if (!directMediaUrl) {
-            const fallbackRes = await fetch(`https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(videoUrl)}`);
-            if (fallbackRes.ok) {
+            const fallbackRes = await fetch(`https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(videoUrl)}`, {
+                agent: insecureAgent
+            }).catch(() => null);
+
+            if (fallbackRes && fallbackRes.ok) {
                 const fbData = await fallbackRes.json();
                 directMediaUrl = fbData.video || fbData.hdplay || fbData.url || (fbData.music ? fbData.music.play_url : null);
             }
         }
 
         if (!directMediaUrl) {
-            return res.status(500).send('Unable to resolve direct stream URL. Ensure link is public.');
+            return res.status(500).send('Unable to extract direct media link. Please verify the URL is public.');
         }
 
         const ext = mode === 'audio' ? 'mp3' : 'mp4';
         const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
 
-        res.setHeader('Content-Disposition', `attachment; filename="downloader_media.${ext}"`);
+        res.setHeader('Content-Disposition', `attachment; filename="download.${ext}"`);
         res.setHeader('Content-Type', contentType);
 
-        // Clean streaming pipe to client browser
+        // Pipe direct stream payload back to client
         const client = directMediaUrl.startsWith('https') ? https : http;
         const streamReq = client.get(directMediaUrl, {
+            rejectUnauthorized: false,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
             }
         }, (streamRes) => {
             if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-                // Handle HTTP redirects
-                const redirectClient = streamRes.headers.location.startsWith('https') ? https : http;
-                redirectClient.get(streamRes.headers.location, (redRes) => redRes.pipe(res));
+                const redirClient = streamRes.headers.location.startsWith('https') ? https : http;
+                redirClient.get(streamRes.headers.location, { rejectUnauthorized: false }, (redRes) => redRes.pipe(res));
             } else {
                 streamRes.pipe(res);
             }
         });
 
         streamReq.on('error', (err) => {
-            if (!res.headersSent) res.status(500).send('Streaming error: ' + err.message);
+            if (!res.headersSent) res.status(500).send('Stream transfer error: ' + err.message);
         });
 
     } catch (err) {
@@ -121,7 +128,7 @@ app.get('/', (req, res) => {
         <div class="p-6 space-y-5">
             <form onsubmit="handleDownload(event)" class="space-y-4">
                 <div>
-                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link (YouTube, TikTok, X, Insta)</label>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link (YouTube, TikTok, X)</label>
                     <div class="relative flex items-center">
                         <input id="video-url" type="text" required placeholder="Paste media link here..." class="w-full pl-4 pr-20 py-3.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-sm focus:ring-2 focus:ring-indigo-500 outline-none" />
                         <button type="button" onclick="pasteClipboard()" class="absolute right-2 px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-medium">Paste</button>
