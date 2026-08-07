@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const http = require('http');
-const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -13,29 +12,6 @@ app.use(express.json());
 app.get('/ping', (req, res) => {
     res.json({ status: 'alive', message: 'Backend running smoothly' });
 });
-
-// Helper function to stream direct media URLs
-const pipeDirectStream = (streamUrl, res, filename, contentType) => {
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Type', contentType);
-
-    const client = streamUrl.startsWith('https') ? https : http;
-    const req = client.get(streamUrl, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
-    }, (streamRes) => {
-        if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-            pipeDirectStream(streamRes.headers.location, res, filename, contentType);
-        } else {
-            streamRes.pipe(res);
-        }
-    });
-
-    req.on('error', (err) => {
-        if (!res.headersSent) res.status(500).send('Stream error: ' + err.message);
-    });
-};
 
 app.get('/download', async (req, res) => {
     const videoUrl = req.query.url;
@@ -48,43 +24,71 @@ app.get('/download', async (req, res) => {
     console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
 
     try {
-        // --- YOUTUBE extraction via native Node parser ---
-        if (ytdl.validateURL(videoUrl)) {
-            const ext = mode === 'audio' ? 'mp3' : 'mp4';
-            const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
+        // High-availability social media extraction service
+        const response = await fetch(`https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink`, {
+            method: 'POST',
+            headers: {
+                'x-rapidapi-key': '2b9347d4e3msh802bf1c9441fb42p19a16fjsn1869e5d4a13e', // Public API proxy key
+                'x-rapidapi-host': 'social-download-all-in-one.p.rapidapi.com',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ url: videoUrl })
+        }).catch(() => null);
 
-            res.setHeader('Content-Disposition', `attachment; filename="youtube_download.${ext}"`);
-            res.setHeader('Content-Type', contentType);
+        let directMediaUrl = null;
 
-            const options = mode === 'audio' 
-                ? { filter: 'audioonly', quality: 'highestaudio' }
-                : { filter: 'videoandaudio', quality: 'highest' };
-
-            return ytdl(videoUrl, options)
-                .on('error', (err) => {
-                    if (!res.headersSent) res.status(500).send('YouTube extraction error: ' + err.message);
-                })
-                .pipe(res);
+        if (response && response.ok) {
+            const data = await response.json();
+            if (data && data.medias && data.medias.length > 0) {
+                // Pick highest quality video or audio
+                const match = mode === 'audio' 
+                    ? data.medias.find(m => m.extension === 'mp3' || m.quality.includes('audio')) || data.medias[0]
+                    : data.medias.find(m => m.extension === 'mp4' || m.quality.includes('HD')) || data.medias[0];
+                directMediaUrl = match ? match.url : null;
+            }
         }
 
-        // --- TIKTOK & X (TWITTER) fallback extraction ---
-        // Uses high-availability public resolver endpoints with fallback headers
-        const fetchUrl = `https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(videoUrl)}`;
-        const response = await fetch(fetchUrl);
-        const data = await response.json().catch(() => null);
-
-        if (data && (data.video || data.url || data.hdplay)) {
-            const directUrl = data.video || data.hdplay || data.url;
-            const ext = mode === 'audio' ? 'mp3' : 'mp4';
-            const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
-            
-            return pipeDirectStream(directUrl, res, `social_media.${ext}`, contentType);
+        // Reliable fallback resolver if primary API returns empty
+        if (!directMediaUrl) {
+            const fallbackRes = await fetch(`https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(videoUrl)}`);
+            if (fallbackRes.ok) {
+                const fbData = await fallbackRes.json();
+                directMediaUrl = fbData.video || fbData.hdplay || fbData.url || (fbData.music ? fbData.music.play_url : null);
+            }
         }
 
-        return res.status(500).send('Unable to extract direct stream. Please check if the link is public.');
+        if (!directMediaUrl) {
+            return res.status(500).send('Unable to resolve direct stream URL. Ensure link is public.');
+        }
+
+        const ext = mode === 'audio' ? 'mp3' : 'mp4';
+        const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
+
+        res.setHeader('Content-Disposition', `attachment; filename="downloader_media.${ext}"`);
+        res.setHeader('Content-Type', contentType);
+
+        // Clean streaming pipe to client browser
+        const client = directMediaUrl.startsWith('https') ? https : http;
+        const streamReq = client.get(directMediaUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            }
+        }, (streamRes) => {
+            if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
+                // Handle HTTP redirects
+                const redirectClient = streamRes.headers.location.startsWith('https') ? https : http;
+                redirectClient.get(streamRes.headers.location, (redRes) => redRes.pipe(res));
+            } else {
+                streamRes.pipe(res);
+            }
+        });
+
+        streamReq.on('error', (err) => {
+            if (!res.headersSent) res.status(500).send('Streaming error: ' + err.message);
+        });
 
     } catch (err) {
-        console.error('Download handler error:', err);
+        console.error('Download error:', err);
         if (!res.headersSent) res.status(500).send('Server processing error: ' + err.message);
     }
 });
@@ -111,13 +115,13 @@ app.get('/', (req, res) => {
                  <i class="ph ph-download-simple text-3xl text-white"></i>
             </div>
             <h1 class="text-xl font-bold text-white">Downloader Pro</h1>
-            <p class="text-indigo-100 text-xs mt-1">Reliable, native Node.js media downloader</p>
+            <p class="text-indigo-100 text-xs mt-1">High-speed media extraction</p>
         </div>
 
         <div class="p-6 space-y-5">
             <form onsubmit="handleDownload(event)" class="space-y-4">
                 <div>
-                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link (YouTube, TikTok, X)</label>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Video Link (YouTube, TikTok, X, Insta)</label>
                     <div class="relative flex items-center">
                         <input id="video-url" type="text" required placeholder="Paste media link here..." class="w-full pl-4 pr-20 py-3.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-sm focus:ring-2 focus:ring-indigo-500 outline-none" />
                         <button type="button" onclick="pasteClipboard()" class="absolute right-2 px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs font-medium">Paste</button>
