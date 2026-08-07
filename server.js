@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const https = require('https');
-const http = require('http');
+const { exec } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -9,142 +8,63 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-const insecureAgent = new https.Agent({ rejectUnauthorized: false });
-
+// Heartbeat endpoint
 app.get('/ping', (req, res) => {
-    res.json({ status: 'alive', message: 'Backend running smoothly' });
+    res.json({ status: 'alive', message: 'Docker backend running smoothly' });
 });
 
-// Helper function to clean clean query parameters for better parsing
-function cleanUrl(rawUrl) {
-    try {
-        const parsed = new URL(rawUrl);
-        // Retain standard youtube v parameter, drop tracking parameters like ?si=
-        if (parsed.hostname.includes('youtube.com') || parsed.hostname.includes('youtu.be')) {
-            return rawUrl.split('&si=')[0].split('?si=')[0];
-        }
-        return rawUrl;
-    } catch (e) {
-        return rawUrl;
-    }
-}
-
-app.get('/download', async (req, res) => {
-    let videoUrl = req.query.url;
+// Media Download Endpoint
+app.get('/download', (req, res) => {
+    const videoUrl = req.query.url;
     const mode = req.query.mode || 'video';
 
     if (!videoUrl) {
         return res.status(400).send('Missing video URL parameter.');
     }
 
-    videoUrl = cleanUrl(videoUrl.trim());
-    console.log('[DOWNLOAD REQUEST] Target: ' + videoUrl + ' | Mode: ' + mode);
+    // Clean URL query parameters (removes tracking tokens like ?si=)
+    const cleanedUrl = videoUrl.trim().split('&si=')[0].split('?si=')[0];
+    console.log('[DOCKER YT-DLP] Target: ' + cleanedUrl + ' | Mode: ' + mode);
 
-    let directMediaUrl = null;
+    let formatArgs = '-f "best[ext=mp4]/best"';
+    let filename = 'download.mp4';
+    let contentType = 'video/mp4';
 
-    try {
-        // --- ENGINE 1: Primary Multi-Service API ---
-        try {
-            const rapidRes = await fetch(`https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink`, {
-                method: 'POST',
-                headers: {
-                    'x-rapidapi-key': '2b9347d4e3msh802bf1c9441fb42p19a16fjsn1869e5d4a13e',
-                    'x-rapidapi-host': 'social-download-all-in-one.p.rapidapi.com',
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ url: videoUrl })
-            });
-
-            if (rapidRes.ok) {
-                const data = await rapidRes.json();
-                if (data && data.medias && data.medias.length > 0) {
-                    const match = mode === 'audio'
-                        ? data.medias.find(m => m.extension === 'mp3' || (m.quality && m.quality.includes('audio'))) || data.medias[0]
-                        : data.medias.find(m => m.extension === 'mp4' || (m.quality && m.quality.includes('HD'))) || data.medias[0];
-                    directMediaUrl = match ? match.url : null;
-                }
-            }
-        } catch (e) {
-            console.log('Engine 1 skipped:', e.message);
-        }
-
-        // --- ENGINE 2: Cobalt Public Engine Fallback ---
-        if (!directMediaUrl) {
-            try {
-                const cobaltRes = await fetch('https://api.cobalt.tools/api/json', {
-                    method: 'POST',
-                    headers: {
-                        'Accept': 'application/json',
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'Mozilla/5.0'
-                    },
-                    body: JSON.stringify({
-                        url: videoUrl,
-                        downloadMode: mode === 'audio' ? 'audio' : 'auto',
-                        videoQuality: '720'
-                    })
-                });
-
-                if (cobaltRes.ok) {
-                    const cData = await cobaltRes.json();
-                    directMediaUrl = cData.url || (cData.picker && cData.picker[0] ? cData.picker[0].url : null);
-                }
-            } catch (e) {
-                console.log('Engine 2 skipped:', e.message);
-            }
-        }
-
-        // --- ENGINE 3: TikTok / Social Dedicated Resolver ---
-        if (!directMediaUrl) {
-            try {
-                const tikRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}`);
-                if (tikRes.ok) {
-                    const tData = await tikRes.json();
-                    if (tData && tData.data) {
-                        directMediaUrl = mode === 'audio' ? tData.data.music : (tData.data.play || tData.data.wmplay);
-                    }
-                }
-            } catch (e) {
-                console.log('Engine 3 skipped:', e.message);
-            }
-        }
-
-        if (!directMediaUrl) {
-            return res.status(500).send('Unable to extract direct media link. Please verify the link is public and accessible.');
-        }
-
-        const ext = mode === 'audio' ? 'mp3' : 'mp4';
-        const contentType = mode === 'audio' ? 'audio/mpeg' : 'video/mp4';
-
-        res.setHeader('Content-Disposition', `attachment; filename="downloader_media.${ext}"`);
-        res.setHeader('Content-Type', contentType);
-
-        // Pipe direct stream buffer back to user
-        const client = directMediaUrl.startsWith('https') ? https : http;
-        const streamReq = client.get(directMediaUrl, {
-            rejectUnauthorized: false,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            }
-        }, (streamRes) => {
-            if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-                const redirClient = streamRes.headers.location.startsWith('https') ? https : http;
-                redirClient.get(streamRes.headers.location, { rejectUnauthorized: false }, (redRes) => redRes.pipe(res));
-            } else {
-                streamRes.pipe(res);
-            }
-        });
-
-        streamReq.on('error', (err) => {
-            if (!res.headersSent) res.status(500).send('Stream error: ' + err.message);
-        });
-
-    } catch (err) {
-        console.error('Download error:', err);
-        if (!res.headersSent) res.status(500).send('Server error: ' + err.message);
+    if (mode === 'audio') {
+        formatArgs = '-f "bestaudio" -x --audio-format mp3';
+        filename = 'download.mp3';
+        contentType = 'audio/mpeg';
     }
+
+    // Construct command using globally installed yt-dlp binary
+    const command = `yt-dlp ${formatArgs} --no-playlist -o - "${cleanedUrl}"`;
+
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', contentType);
+
+    // Spawn child process with a 500MB buffer safety margin
+    const child = exec(command, { maxBuffer: 1024 * 1024 * 500 });
+
+    // Pipe process binary stream directly to client response
+    child.stdout.pipe(res);
+
+    child.stderr.on('data', (data) => {
+        console.error('[yt-dlp log]:', data.toString());
+    });
+
+    child.on('error', (err) => {
+        console.error('Process execution error:', err);
+        if (!res.headersSent) {
+            res.status(500).send('Failed to start media extractor.');
+        }
+    });
+
+    req.on('close', () => {
+        child.kill();
+    });
 });
 
+// Web Frontend Interface
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -167,7 +87,7 @@ app.get('/', (req, res) => {
                  <i class="ph ph-download-simple text-3xl text-white"></i>
             </div>
             <h1 class="text-xl font-bold text-white">Downloader Pro</h1>
-            <p class="text-indigo-100 text-xs mt-1">Multi-Engine High-Speed Extractor</p>
+            <p class="text-indigo-100 text-xs mt-1">Docker Native Engine</p>
         </div>
 
         <div class="p-6 space-y-5">
@@ -237,4 +157,4 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-app.listen(PORT, () => console.log('Server running on port ' + PORT));
+app.listen(PORT, () => console.log('Docker server running on port ' + PORT));
