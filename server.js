@@ -8,12 +8,10 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Heartbeat endpoint
 app.get('/ping', (req, res) => {
     res.json({ status: 'alive', message: 'Docker backend running smoothly' });
 });
 
-// Media Download Endpoint
 app.get('/download', (req, res) => {
     const videoUrl = req.query.url;
     const mode = req.query.mode || 'video';
@@ -22,30 +20,33 @@ app.get('/download', (req, res) => {
         return res.status(400).send('Missing video URL parameter.');
     }
 
-    // Clean URL query parameters (removes tracking tokens like ?si=)
+    // Clean URL tracking parameters
     const cleanedUrl = videoUrl.trim().split('&si=')[0].split('?si=')[0];
     console.log('[DOCKER YT-DLP] Target: ' + cleanedUrl + ' | Mode: ' + mode);
 
-    let formatArgs = '-f "best[ext=mp4]/best"';
-    let filename = 'download.mp4';
-    let contentType = 'video/mp4';
+    let formatArgs = '';
+    let filename = '';
+    let contentType = '';
 
     if (mode === 'audio') {
-        formatArgs = '-f "bestaudio" -x --audio-format mp3';
+        // Extract best audio and pipe through ffmpeg to output a standard MP3 stream
+        formatArgs = '-f "bestaudio" --extract-audio --audio-format mp3';
         filename = 'download.mp3';
         contentType = 'audio/mpeg';
+    } else {
+        // Enforce progressive MP4 (h264 + aac) compatible with all phones & browsers
+        formatArgs = '-f "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"';
+        filename = 'download.mp4';
+        contentType = 'video/mp4';
     }
 
-    // Construct command using globally installed yt-dlp binary
     const command = `yt-dlp ${formatArgs} --no-playlist -o - "${cleanedUrl}"`;
 
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Type', contentType);
 
-    // Spawn child process with a 500MB buffer safety margin
     const child = exec(command, { maxBuffer: 1024 * 1024 * 500 });
 
-    // Pipe process binary stream directly to client response
     child.stdout.pipe(res);
 
     child.stderr.on('data', (data) => {
@@ -55,7 +56,7 @@ app.get('/download', (req, res) => {
     child.on('error', (err) => {
         console.error('Process execution error:', err);
         if (!res.headersSent) {
-            res.status(500).send('Failed to start media extractor.');
+            res.status(500).send('Failed to process media file.');
         }
     });
 
@@ -64,7 +65,6 @@ app.get('/download', (req, res) => {
     });
 });
 
-// Web Frontend Interface
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en" class="dark">
